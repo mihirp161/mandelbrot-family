@@ -11,6 +11,7 @@ suppressPackageStartupMessages({
   library(doParallel)
   library(foreach)
   library(Rcpp)
+  library(ambient)
 })
 
 # -- Shared output config ---------------------------------------
@@ -49,7 +50,7 @@ mandelbrot <- function(xmin     = -2.2,
   y <- seq(ymin, ymax, length.out = height)
   
   # Grid of c values; row = imaginary axis, col = real axis
-  C <- outer(y, x, function(im, re) complex(real = re, imaginary = im))
+  C <- outer(y, x, function(Im, re) complex(real = re, imaginary = Im))
   
   z      <- matrix(0 + 0i, height, width)
   counts <- matrix(0,      height, width)
@@ -98,7 +99,7 @@ julia <- function(cx       = -0.7269,
   y <- seq(ymin, ymax, length.out = height)
   
   K <- complex(real = cx, imaginary = cy)   # fixed parameter
-  z <- outer(y, x, function(im, re) complex(real = re, imaginary = im))
+  z <- outer(y, x, function(Im, re) complex(real = re, imaginary = Im))
   
   counts <- matrix(0,    height, width)
   active <- matrix(TRUE, height, width)
@@ -124,7 +125,7 @@ render(
 
 # -- 3. Burning Ship -------------------------------------------
 # One modification: fold z back into the first quadrant before squaring.
-#   z_{n+1} = (|Re(z)| + i|im(z)|)^2 + c
+#   z_{n+1} = (|Re(z)| + i|Im(z)|)^2 + c
 # This breaks the vertical symmetry of the Mandelbrot and produces
 # a shape that looks eerily like a fleet of ships on fire.
 # The "hull" sits near c ≈ -1.755 + 0.028i in the lower half-plane.
@@ -139,7 +140,7 @@ burning_ship <- function(xmin     = -2.5,
   
   x <- seq(xmin, xmax, length.out = width)
   y <- seq(ymin, ymax, length.out = height)
-  C <- outer(y, x, function(im, re) complex(real = re, imaginary = im))
+  C <- outer(y, x, function(Im, re) complex(real = re, imaginary = Im))
   
   z      <- matrix(0 + 0i, height, width)
   counts <- matrix(0,      height, width)
@@ -148,7 +149,7 @@ burning_ship <- function(xmin     = -2.5,
   for (k in seq_len(max_iter)) {
     za        <- z[active]
     z[active] <- complex(real      = abs(Re(za)),
-                         imaginary = abs(im(za)))^2 + C[active]
+                         imaginary = abs(Im(za)))^2 + C[active]
     
     esc <- active & Mod(z) > 2
     counts[esc] <- k - log2(pmax(log2(pmax(Mod(z[esc]), 1.0)), 1e-10))
@@ -214,7 +215,7 @@ buddhabrot <- function(n_points = 2e6,
   # Map complex coordinate -> integer pixel index
   to_px <- function(z_vec) {
     col <- pmin(pmax(floor((Re(z_vec) + 2) / 4 * (size - 1)) + 1L, 1L), size)
-    row <- pmin(pmax(floor((im(z_vec) + 2) / 4 * (size - 1)) + 1L, 1L), size)
+    row <- pmin(pmax(floor((Im(z_vec) + 2) / 4 * (size - 1)) + 1L, 1L), size)
     cbind(row, col)
   }
   
@@ -264,3 +265,98 @@ buddhabrot_pal <- function(n) {
 }
 
 render(buddhabrot(), "buddhabrot.png", buddhabrot_pal)
+
+
+# -------------------------------------------------------------------------
+# Fractal Procedural Terrain (fBm + Ridged Multi-Fractal)
+
+
+suppressPackageStartupMessages({
+  library(ambient)
+  library(png)
+})
+
+# -- Configuration ----------------------------------------------
+SiZE     <- 1200L   # pixel dimensions (square)
+DPi      <- 150L
+
+# -- The Fractal Terrain Generator ------------------------------
+# 1 Base fBm: Iterates smooth noise to form continents and plains.
+# 2 Ridged Fractal: Takes the absolute value of the noise at each step, 
+#    folding the waves into sharp, jagged peaks for mountain ranges.
+stylegan_terrain <- function(width       = SiZE,
+                             height      = SiZE,
+                             octaves     = 9,
+                             persistence = 0.5,
+                             lacunarity  = 2.0) {
+  
+  # Create the Cartesian grid
+  grid <- long_grid(x = seq(0, 4.5, length.out = width),
+                    y = seq(0, 4.5, length.out = height))
+  
+  # Initialize two parallel fractal layers
+  base_vec  <- rep(0, width * height)
+  ridge_vec <- rep(0, width * height)
+  
+  amplitude <- 1.0
+  frequency <- 1.0
+  
+  # FRACTAL ITERATION LOOP
+  for (k in seq_len(octaves)) {
+    
+    # Generate the raw Simplex noise wave at the current frequency
+    raw_noise <- gen_simplex(grid$x * frequency, grid$y * frequency)
+    
+    # Accumulate smooth continents
+    base_vec <- base_vec + (raw_noise * amplitude)
+    
+    # Accumulate sharp mountains: (1 - |noise|)^2
+    sharp_noise <- (1.0 - abs(raw_noise))^2
+    ridge_vec   <- ridge_vec + (sharp_noise * amplitude)
+    
+    # Scale parameters for the next iteration
+    amplitude <- amplitude * persistence
+    frequency <- frequency * lacunarity
+  }
+  
+  # Normalize both layers to [0, 1]
+  base_norm  <- (base_vec - min(base_vec)) / diff(range(base_vec))
+  ridge_norm <- (ridge_vec - min(ridge_vec)) / diff(range(ridge_vec))
+  
+  # MASKING & SHAPING
+  # base^2.5 flattens valleys into oceans.
+  # Multiplying ridges by the base ensures mountains only grow inland.
+  final_terrain <- (base_norm^2.5) + ((base_norm^1.5) * ridge_norm * 1.8)
+  
+  # Final normalization for color mapping
+  final_terrain <- (final_terrain - min(final_terrain)) / diff(range(final_terrain))
+  matrix(final_terrain, nrow = height, ncol = width)
+}
+
+# -- Dedicated Terrain Renderer ---------------------------------
+render_terrain <- function(m, file, palette_fn) {
+  png(file, width = SiZE, height = SiZE, res = DPi, bg = "black")
+  par(mar = c(0, 0, 0, 0), oma = c(0, 0, 0, 0))
+  
+  image(t(m), col = palette_fn(2048L), axes = FALSE, useRaster = TRUE)
+  
+  dev.off()
+  message("\u2713  ", file)
+}
+
+# -- Topographic Palette ------------------------------
+stylegan_pal <- function(n) {
+  colorRampPalette(
+    c("#0b1626", "#172d47", "#294a6e", "#3a6894",   # Deep Ocean / Shallows
+      "#baa37b", "#a18a60", "#7a6a4b",              # Plains / Heartlands
+      "#4a5c37", "#324022", "#1f2b13",              # Forests
+      "#464a4d", "#646b70", "#868e94",              # Rock / Mountain Ridges
+      "#dce1e6", "#ffffff")                         # Snowcaps
+  )(n)
+}
+
+render_terrain(
+  stylegan_terrain(), 
+  "perlin_landscape.png", 
+  stylegan_pal
+)
